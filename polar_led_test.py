@@ -3,7 +3,8 @@ import time
 import numpy as np
 import math
 from bleak import BleakClient, BleakScanner
-import RPi.GPIO as GPIO
+import board
+import neopixel
 
 # Polar H10 UUIDs
 PMD_SERVICE = "fb005c80-02e7-f387-1cad-8acd2d8df0c8"
@@ -11,12 +12,13 @@ PMD_CONTROL = "fb005c81-02e7-f387-1cad-8acd2d8df0c8"
 PMD_DATA = "fb005c82-02e7-f387-1cad-8acd2d8df0c8"
 DEVICE_NAME = "Polar H10"
 
-# GPIO setup
-LED_PIN = 18
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(LED_PIN, GPIO.OUT)
-pwm = GPIO.PWM(LED_PIN, 100)  # 100 Hz PWM frequency
-pwm.start(0)  # Start PWM with 0% duty cycle
+# LED strip configuration:
+LED_COUNT = 60        # Number of LED pixels.
+LED_PIN = board.D18   # GPIO pin connected to the pixels (18 uses PWM!)
+LED_BRIGHTNESS = 0.5  # Set to 0 for darkest and 1 for brightest
+
+# Create NeoPixel object with appropriate configuration
+pixels = neopixel.NeoPixel(LED_PIN, LED_COUNT, brightness=LED_BRIGHTNESS, auto_write=False)
 
 class PolarH10:
     def __init__(self, device):
@@ -60,22 +62,23 @@ class PolarH10:
                 self.min_z = min(self.min_z, self.acc_z_smooth)
                 self.max_z = max(self.max_z, self.acc_z_smooth)
 
-                # Map smoothed Z-axis acceleration to LED brightness (0-100)
+                # Map smoothed Z-axis acceleration to LED brightness (0-255)
                 if self.max_z != self.min_z:
                     normalized_z = (self.max_z - self.acc_z_smooth) / (self.max_z - self.min_z)
-                    self.led_brightness = normalized_z * 100
+                    self.led_brightness = int(normalized_z * 255)
                 else:
-                    self.led_brightness = 50  # Default to 50% brightness if max == min
+                    self.led_brightness = 127  # Default to middle brightness if max == min
 
-                self.led_brightness = max(0, min(100, self.led_brightness))  # Clamp to [0, 100]
+                self.led_brightness = max(0, min(255, self.led_brightness))  # Clamp to [0, 255]
 
-                # Update LED brightness
-                pwm.ChangeDutyCycle(self.led_brightness)
+                # Update LED strip
+                pixels.fill((self.led_brightness, self.led_brightness, self.led_brightness))
+                pixels.show()
 
                 print(f"Z-axis acceleration: {z:.3f}")
                 print(f"Smoothed Z-axis: {self.acc_z_smooth:.3f}")
                 print(f"Min Z: {self.min_z:.3f}, Max Z: {self.max_z:.3f}")
-                print(f"LED Brightness: {self.led_brightness:.1f}%")
+                print(f"LED Brightness: {self.led_brightness}")
 
 async def main():
     print("Scanning for Polar H10 device...")
@@ -100,8 +103,9 @@ async def main():
         print("Disconnecting...")
     finally:
         await polar.disconnect()
-        pwm.stop()
-        GPIO.cleanup()
+        # Turn off all LEDs
+        pixels.fill((0, 0, 0))
+        pixels.show()
 
 if __name__ == "__main__":
     try:
@@ -109,5 +113,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("Script terminated by user")
     finally:
-        pwm.stop()
-        GPIO.cleanup()
+        # Turn off all LEDs
+        pixels.fill((0, 0, 0))
+        pixels.show()
