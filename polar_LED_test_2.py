@@ -19,7 +19,8 @@ class PolarH10:
     def __init__(self, device):
         self.device = device
         self.client = None
-        self.active_leds = 0  # Number of active LEDs
+        self.target_leds = 0  # Target LED count based on breath data
+        self.current_leds = 0  # Current displayed LED count
 
         # Accelerometer parameters
         self.ACC_SAMPLE_RATE = 200  # Hz
@@ -106,85 +107,25 @@ class PolarH10:
                         self.update_breathing_cycle()
                         self.update_led_count()
 
-    def update_acc_vectors(self, acc):
-        if np.isnan(self.acc_gravity).any():
-            self.acc_gravity = acc
-        else:
-            self.acc_gravity = self.GRAVITY_ALPHA * self.acc_gravity + (1 - self.GRAVITY_ALPHA) * acc
-
-        acc_zero_centred = acc - self.acc_gravity
-        self.acc_zero_centred_exp_mean = self.ACC_MEAN_ALPHA * self.acc_zero_centred_exp_mean + (1 - self.ACC_MEAN_ALPHA) * acc_zero_centred
-
-    def update_breathing_acc(self, t):
-        if t - self.t_last_breath_acc_update > 1 / self.BR_ACC_SAMPLE_RATE:
-            self.breath_acc_hist = np.roll(self.breath_acc_hist, -1)
-            new_acc = np.dot(self.acc_zero_centred_exp_mean, self.acc_principle_axis)
-            
-            # Apply bandpass filter
-            if np.all(~np.isnan(self.breath_acc_hist)):
-                filtered_acc = signal.filtfilt(self.b, self.a, self.breath_acc_hist)
-                new_acc = filtered_acc[-1]
-
-            self.breath_acc_hist[-1] = new_acc - self.noise_offset
-            self.breath_acc_times = np.roll(self.breath_acc_times, -1)
-            self.breath_acc_times[-1] = t
-            self.t_last_breath_acc_update = t
-
-            # Check for large movements
-            if not self.is_calibrating and abs(new_acc) > self.MOVEMENT_THRESHOLD:
-                print("Large movement detected. Ignoring this sample.")
-                return False
-
-            return True
-        return False
-
-    def check_calibration_status(self, t):
-        elapsed_time = t - self.calibration_start_time
-        
-        if elapsed_time <= self.DEEP_BREATH_PERIOD:
-            self.deep_breath_samples.append(self.breath_acc_hist[-1])
-        elif self.hold_breath_start is None:
-            print("Now hold your breath for 10 seconds.")
-            self.hold_breath_start = t
-        elif elapsed_time <= self.DEEP_BREATH_PERIOD + self.HOLD_BREATH_DURATION:
-            self.hold_breath_samples.append(self.breath_acc_hist[-1])
-        else:
-            self.finish_calibration()
-
-    def update_breathing_cycle(self):
-        current_br_phase = np.sign(self.breath_acc_hist[-1])
-
-        if current_br_phase == self.br_last_phase or current_br_phase >= 0:
-            self.br_last_phase = current_br_phase
-            return
-
-        self.current_br = 60.0 / (self.breath_acc_times[-1] - self.breath_acc_times[-2])
-        
-        if self.current_br > self.BR_MAX_FILTER:
-            return
-
-        self.br_last_phase = current_br_phase
-
-    def finish_calibration(self):
-        self.is_calibrating = False
-        self.breath_min = np.min(self.deep_breath_samples)
-        self.breath_max = np.max(self.deep_breath_samples)
-        self.noise_offset = np.mean(self.hold_breath_samples)
-        print("Calibration finished. Breathing range established.")
-        print(f"Calibrated range - Min: {self.breath_min:.3f}, Max: {self.breath_max:.3f}")
-        print(f"Noise offset: {self.noise_offset:.3f}")
-
     def update_led_count(self):
         if self.breath_min is not None and self.breath_max is not None:
             # Normalize the breath signal
             normalized_breath = (self.breath_acc_hist[-1] - self.breath_min) / (self.breath_max - self.breath_min)
+            self.target_leds = int(normalized_breath * LED_COUNT)
+            self.target_leds = max(0, min(LED_COUNT, self.target_leds))  # Clamp to [0, LED_COUNT]
+
+    async def gradual_led_update(self):
+        # Run this in a loop to update LED states gradually
+        while True:
+            if self.current_leds < self.target_leds:
+                self.current_leds += 1  # Increment to approach the target smoothly
+            elif self.current_leds > self.target_leds:
+                self.current_leds -= 1  # Decrement to approach the target smoothly
             
-            # Calculate active LEDs: 0 at min (exhale), 150 at max (inhale)
-            self.active_leds = int(normalized_breath * LED_COUNT)
-            self.active_leds = max(0, min(LED_COUNT, self.active_leds))  # Clamp to [0, LED_COUNT]
-            
-            print(f"Breathing signal: {self.breath_acc_hist[-1]:.3f}")
-            print(f"Active LEDs: {self.active_leds} / {LED_COUNT}")
+            # Update your LED hardware here to reflect self.current_leds
+            print(f"Updated LED count: {self.current_leds}")
+
+            await asyncio.sleep(0.05)  # Adjust speed of change here
 
 async def main():
     print("Scanning for Polar H10 device...")
@@ -202,11 +143,14 @@ async def main():
         await polar.connect()
         await polar.start_acc_stream()
         
+        led_update_task = asyncio.create_task(polar.gradual_led_update())
+        
         # Keep the script running
         while True:
             await asyncio.sleep(1)
+            
     except asyncio.CancelledError:
-        print("Disconnecting...")
+        led_update_task.cancel()
     finally:
         await polar.disconnect()
 
