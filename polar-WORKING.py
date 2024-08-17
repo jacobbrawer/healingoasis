@@ -1,5 +1,3 @@
-
-
 import asyncio
 import time
 import numpy as np
@@ -13,6 +11,7 @@ import neopixel_spi as neopixel
 PMD_SERVICE = "fb005c80-02e7-f387-1cad-8acd2d8df0c8"
 PMD_CONTROL = "fb005c81-02e7-f387-1cad-8acd2d8df0c8"
 PMD_DATA = "fb005c82-02e7-f387-1cad-8acd2d8df0c8"
+HEART_RATE_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
 DEVICE_NAME = "Polar H10"
 
 # LED configuration
@@ -40,7 +39,7 @@ class PolarH10:
         self.MOVEMENT_THRESHOLD = 0.1
 
         # Calibration parameters
-        self.CALIBRATION_DURATION = 30
+        self.CALIBRATION_DURATION = 32
         self.BREATH_CYCLE_DURATION = 8
         self.is_calibrating = False
         self.calibration_start_time = None
@@ -48,6 +47,10 @@ class PolarH10:
         self.breath_min = None
         self.breath_max = None
         self.last_active_leds = -1
+
+        # Heart rate detection
+        self.heart_rate_detected = False
+        self.heart_rate_detection_start = None
 
         # Initialization
         self.acc_gravity = np.full(3, np.nan)
@@ -57,11 +60,6 @@ class PolarH10:
         self.breath_acc_times = np.full(self.BR_ACC_HIST_SIZE, np.nan)
         self.br_last_phase = 0
         self.current_br = 0
-
-        # Calibration initiation
-        self.waiting_for_calibration = True
-        self.deep_breath_threshold = 0.5  # Adjust as needed
-        self.last_breath_value = 0
 
         # Bandpass filter for breathing signal
         self.lowcut = 0.1  # Hz
@@ -90,6 +88,7 @@ class PolarH10:
                 print(f"Connected: {self.client.is_connected}")
 
                 await self.start_acc_stream()
+                await self.start_heart_rate_stream()
                 return True
             except Exception as e:
                 print(f"Connection failed: {str(e)}. Retrying in 10 seconds...")
@@ -102,13 +101,30 @@ class PolarH10:
         self.pixels.show()
 
     async def start_acc_stream(self):
-        await self.client.write_gatt_char(PMD_CONTROL, bytearray([0x02, 0x02, 0x00, 0x01, 0xC8, 0x00, 0x01, 0x01, 0x10, 0x00, 0x02, 0x01, 0x08, 0x00]), response=True)
-        await self.client.start_notify(PMD_DATA, self.acc_data_handler)
-        print("ACC stream started")
-        self.waiting_for_calibration = True
-        self.update_leds(color=(0, 0, 255), num_leds=LED_COUNT // 2)  # Blue color, half of the LEDs lit
+        try:
+            await self.client.write_gatt_char(PMD_CONTROL, bytearray([0x02, 0x02, 0x00, 0x01, 0xC8, 0x00, 0x01, 0x01, 0x10, 0x00, 0x02, 0x01, 0x08, 0x00]), response=True)
+            await self.client.start_notify(PMD_DATA, self.acc_data_handler)
+            print("ACC stream started")
+            self.update_leds(color=(0, 0, 255), num_leds=LED_COUNT // 2)  # Blue color, half of the LEDs lit
+        except Exception as e:
+            print(f"Error starting ACC stream: {str(e)}")
+
+    async def start_heart_rate_stream(self):
+        try:
+            await self.client.start_notify(HEART_RATE_UUID, self.heart_rate_handler)
+            print("Heart rate stream started")
+        except Exception as e:
+            print(f"Error starting heart rate stream: {str(e)}")
+
+    def heart_rate_handler(self, sender, data):
+        print(f"Received heart rate data: {data.hex()}")
+        if not self.heart_rate_detected:
+            self.heart_rate_detected = True
+            self.heart_rate_detection_start = time.time()
+            print("Heart rate detected")
 
     def acc_data_handler(self, sender, data):
+        print(f"Received ACC data: {data.hex()}")
         if data[0] == 0x02:
             frame_type = data[9]
             resolution = (frame_type + 1) * 8
@@ -129,11 +145,13 @@ class PolarH10:
                 new_breathing_acc = self.update_breathing_acc(t)
 
                 if new_breathing_acc:
-                    if self.waiting_for_calibration:
-                        self.check_for_calibration_start()
+                    print(f"New breathing acc: {self.breath_acc_hist[-1]}")
+                    if self.heart_rate_detected and time.time() - self.heart_rate_detection_start >= 5:
+                        if not self.is_calibrating:
+                            self.start_calibration()
                     elif self.is_calibrating:
                         self.update_calibration(t)
-                    else:
+                    elif self.breath_min is not None and self.breath_max is not None:
                         self.update_breathing_cycle()
                         self.update_led_count()
 
@@ -160,27 +178,25 @@ class PolarH10:
             self.breath_acc_times[-1] = t
             self.t_last_breath_acc_update = t
 
-            if not self.is_calibrating and not self.waiting_for_calibration and abs(new_acc) > self.MOVEMENT_THRESHOLD:
+            if not self.is_calibrating and self.breath_min is not None and abs(new_acc) > self.MOVEMENT_THRESHOLD:
                 print("Large movement detected. Ignoring this sample.")
                 return False
 
             return True
         return False
 
-    def check_for_calibration_start(self):
-        current_breath = self.breath_acc_hist[-1]
-        if abs(current_breath - self.last_breath_value) > self.deep_breath_threshold:
-            print("Deep breath detected. Starting calibration.")
-            self.start_calibration()
-        self.last_breath_value = current_breath
-
     def start_calibration(self):
         self.is_calibrating = True
-        self.waiting_for_calibration = False
         self.calibration_start_time = time.time()
         self.calibration_samples = []
         print(f"Calibration started. Follow the breath guide for {self.CALIBRATION_DURATION} seconds.")
+        asyncio.create_task(self.flash_red())
         print("Breathe in as the blue lights increase, out as they decrease.")
+
+    async def flash_red(self):
+        self.update_leds(color=(255, 0, 0), num_leds=LED_COUNT)
+        await asyncio.sleep(1)
+        self.update_leds(color=(0, 0, 0), num_leds=0)
 
     def update_calibration(self, t):
         elapsed_time = t - self.calibration_start_time
@@ -207,7 +223,7 @@ class PolarH10:
             print(f"Calibrated range - Min: {self.breath_min:.3f}, Max: {self.breath_max:.3f}")
         else:
             print("\nCalibration failed: No samples collected.")
-            self.waiting_for_calibration = True
+            self.heart_rate_detected = False
 
     def update_breathing_cycle(self):
         current_br_phase = np.sign(self.breath_acc_hist[-1])
@@ -229,7 +245,7 @@ class PolarH10:
             inverted_normalized_breath = 1 - normalized_breath
             self.active_leds = int(inverted_normalized_breath * LED_COUNT)
             self.active_leds = max(0, min(LED_COUNT, self.active_leds))
-            self.update_leds(color=(255, 0, 0), num_leds=self.active_leds)  # Red color for normal operation
+            self.update_leds(color=(255, 165, 0), num_leds=self.active_leds)  # Orange color for normal operation
 
     def update_leds(self, color, num_leds):
         try:
@@ -237,6 +253,7 @@ class PolarH10:
             for i in range(num_leds):
                 self.pixels[i] = color
             self.pixels.show()
+            print(f"Updated LEDs: color={color}, num_leds={num_leds}")
         except Exception as e:
             print(f"Error updating LEDs: {str(e)}")
 
@@ -245,13 +262,21 @@ async def main():
     
     while True:
         if not polar.client or not polar.client.is_connected:
-            await polar.connect()
-        
+            connected = await polar.connect()
+            if not connected:
+                print("Failed to connect. Retrying in 60 seconds...")
+                await asyncio.sleep(60)
+                continue
+
         try:
+            print("Entering main loop. Waiting for data...")
             while polar.client.is_connected:
-                await asyncio.sleep(60)  # Check connection every minute
+                await asyncio.sleep(1)  # Check connection every second
+                if time.time() - polar.t_last_breath_acc_update > 5:
+                    print("No data received for 5 seconds. Reconnecting...")
+                    break
         except Exception as e:
-            print(f"Error: {str(e)}. Attempting to reconnect...")
+            print(f"Error in main loop: {str(e)}. Attempting to reconnect...")
         
         await polar.disconnect()
 
